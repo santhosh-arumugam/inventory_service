@@ -5,7 +5,6 @@ import com.swiftcart.inventory_service.entity.OrderCreatedEvent;
 import com.swiftcart.inventory_service.entity.OrderItem;
 import com.swiftcart.inventory_service.entity.event.StockEvent;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.kafka.annotation.KafkaListener;
 import org.springframework.kafka.core.KafkaTemplate;
