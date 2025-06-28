@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
 
 @Service
 @Slf4j
@@ -22,6 +23,7 @@ public class InventoryEventProducerService {
     @Value("${inventory.topic.name:inventory-events}")
     private String topicName;
 
+    @Transactional("kafkaTransactionManager")
     public void publishInventoryEvent(InventoryEvent event) throws Exception {
         String eventJson = objectMapper.writeValueAsString(event);
         kafkaTemplate.send(topicName, event.getRequestId(), eventJson);

@@ -43,7 +43,7 @@ public class InventoryService {
         }
     }
 
-    @Transactional
+    @Transactional ("transactionManager")
     public void processOrderCreatedEvent(OrderCreatedEvent event) throws Exception {
         String requestId = event.getRequestId();
         Long orderId = event.getOrderId();
@@ -66,7 +66,7 @@ public class InventoryService {
             Integer requestedQuantity = orderItem.getQuantity();
 
             // Lock inventory row to prevent race conditions
-            Optional<Inventory> inventoryOpt = inventoryRepository.findByIdForUpdate(productId);
+            Optional<Inventory> inventoryOpt = inventoryRepository.findById(productId);
             if (inventoryOpt.isEmpty()) {
                 allStockAvailable = false;
                 failureReason = "Product not found: " + productId;

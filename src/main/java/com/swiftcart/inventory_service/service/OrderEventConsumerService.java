@@ -20,7 +20,7 @@ public class OrderEventConsumerService {
         this.inventoryService = inventoryService;
     }
 
-    @KafkaListener(topics = "order-events", groupId = "inventory-service-consumer-group")
+    @KafkaListener(topics = "orders-events", groupId = "inventory-service-consumer-group")
     public void consumeOrderCreatedEvent(String message, Acknowledgment acknowledgment) throws JsonProcessingException {
         try {
             OrderCreatedEvent event = objectMapper.readValue(message, OrderCreatedEvent.class);
