@@ -5,6 +5,7 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.time.OffsetDateTime;
 import java.util.List;
 
 @Getter
@@ -12,10 +13,12 @@ import java.util.List;
 @NoArgsConstructor
 @AllArgsConstructor
 public class InventoryEvent {
+    private int version = 1;
     private String eventType;
     private String requestId;
     private Long orderId;
     private List<OrderItem> orderItems;
+    private OffsetDateTime ts;
     private String status;
     private String reason;
 
