@@ -1,61 +1,100 @@
 package com.swiftcart.inventory_service.service;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.swiftcart.inventory_service.dto.InventoryEvent;
 import com.swiftcart.inventory_service.dto.OrderCreatedEvent;
 import com.swiftcart.inventory_service.entity.Inventory;
 import com.swiftcart.inventory_service.entity.OrderEventLog;
+import com.swiftcart.inventory_service.entity.OutboxEvent;
 import com.swiftcart.inventory_service.repository.InventoryRepository;
 import com.swiftcart.inventory_service.repository.OrderEventLogRepository;
+import com.swiftcart.inventory_service.repository.OutboxEventRepository;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Optional;
+import java.util.UUID;
+import java.util.concurrent.TimeUnit;
 
 @Service
 @Slf4j
 public class InventoryService {
-
     private final OrderEventLogRepository orderEventLogRepository;
     private final InventoryRepository inventoryRepository;
-    private final InventoryEventProducerService eventProducerService;
+    private final OutboxEventRepository outboxEventRepository;
+    private final StockService stockService;
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final ObjectMapper objectMapper;
 
     public InventoryService(
             OrderEventLogRepository orderEventLogRepository,
             InventoryRepository inventoryRepository,
-            InventoryEventProducerService eventProducerService
+            OutboxEventRepository outboxEventRepository,
+            StockService stockService,
+            RedisTemplate<String, Object> redisTemplate,
+            ObjectMapper objectMapper
     ) {
         this.orderEventLogRepository = orderEventLogRepository;
         this.inventoryRepository = inventoryRepository;
-        this.eventProducerService = eventProducerService;
+        this.outboxEventRepository = outboxEventRepository;
+        this.stockService = stockService;
+        this.redisTemplate = redisTemplate;
+        this.objectMapper = objectMapper;
     }
 
-    /**
-     * Checks if the requestId is a duplicate in Postgres.
-     * @param requestId The unique identifier for the event
-     * @throws RuntimeException if the request is a duplicate
-     */
-    private void checkForDuplicateRequest(String requestId) {
-        if (orderEventLogRepository.existsById(requestId)) {
-            log.warn("Duplicate request detected in database: requestId={}", requestId);
-            throw new RuntimeException(String.format("Duplicate ORDER_CREATED event: requestId=%s", requestId));
+    private boolean checkForDuplicateRequest(String requestId) {
+        String idempotencyKey = "idempotency:request:" + requestId;
+        Boolean isNewRequest = redisTemplate.opsForValue().setIfAbsent(idempotencyKey, "PROCESSED");
+        if (Boolean.TRUE.equals(isNewRequest)) {
+            redisTemplate.expire(idempotencyKey, 24, TimeUnit.HOURS);
+            return true;
         }
+        log.warn("Duplicate request detected in Redis: requestId={}", requestId);
+        return false;
     }
 
-    @Transactional ("transactionManager")
-    public void processOrderCreatedEvent(OrderCreatedEvent event) throws Exception {
+    private Optional<Inventory> getInventory(Long productId) {
+        String cacheKey = "cache:productId:" + productId;
+        Integer cachedStock = (Integer) redisTemplate.opsForValue().get(cacheKey);
+        if (cachedStock != null) {
+            Inventory inventory = new Inventory();
+            inventory.setProductId(productId);
+            inventory.setQuantity(cachedStock);
+            return Optional.of(inventory);
+        }
+
+        Optional<Inventory> inventoryOpt = inventoryRepository.findById(productId);
+        if (inventoryOpt.isPresent()) {
+            Inventory inventory = inventoryOpt.get();
+            redisTemplate.opsForValue().set(cacheKey, inventory.getQuantity(), 1, TimeUnit.HOURS);
+            return inventoryOpt;
+        }
+        return Optional.empty();
+    }
+
+    @Transactional("transactionManager")
+    public void processOrderCreatedEvent(OrderCreatedEvent event) {
         String requestId = event.getRequestId();
         Long orderId = event.getOrderId();
 
-        // Check for duplicate request
-        checkForDuplicateRequest(requestId);
+        // Check idempotency
+        if (!checkForDuplicateRequest(requestId)) {
+            log.warn("Duplicate ORDER_CREATED event skipped: requestId={}", requestId);
+            return; // Skip processing without throwing exception
+        }
 
         // Initialize inventory event
         InventoryEvent inventoryEvent = new InventoryEvent();
+        inventoryEvent.setVersion(1);
         inventoryEvent.setRequestId(requestId);
         inventoryEvent.setOrderId(orderId);
         inventoryEvent.setOrderItems(new ArrayList<>());
+        inventoryEvent.setTs(OffsetDateTime.now());
 
         boolean allStockAvailable = true;
         String failureReason = null;
@@ -63,55 +102,72 @@ public class InventoryService {
         // Process each order item
         for (OrderCreatedEvent.OrderItem orderItem : event.getOrderItems()) {
             Long productId = orderItem.getProductId();
-            Integer requestedQuantity = orderItem.getQuantity();
+            Integer requestedQty = orderItem.getQuantity();
 
-            // Lock inventory row to prevent race conditions
-            Optional<Inventory> inventoryOpt = inventoryRepository.findById(productId);
+            // Cache-aside: Get inventory
+            Optional<Inventory> inventoryOpt = getInventory(productId);
             if (inventoryOpt.isEmpty()) {
                 allStockAvailable = false;
-                failureReason = "Product not found: " + productId;
+                failureReason = "Product not found: productId=" + productId;
                 break;
             }
 
-            Inventory inventory = inventoryOpt.get();
-            int currentStock = inventory.getQuantity();
-
-            // Check stock availability
-            if (currentStock >= requestedQuantity) {
-                // Reserve stock
-                inventory.setQuantity(currentStock - requestedQuantity);
+            // Reserve stock in Redis
+            boolean reserved = stockService.reserveStock(productId, requestedQty);
+            if (reserved) {
+                // Update Postgres
+                Inventory inventory = inventoryOpt.get();
+                inventory.setQuantity(inventory.getQuantity() - requestedQty);
                 inventoryRepository.save(inventory);
 
+                // Invalidate cache
+                redisTemplate.delete("cache:productId:" + productId);
+
                 // Add to inventory event
-                inventoryEvent.getOrderItems().add(
-                        new InventoryEvent.OrderItem(productId, requestedQuantity)
-                );
+                inventoryEvent.getOrderItems().add(new InventoryEvent.OrderItem(productId, requestedQty));
             } else {
                 allStockAvailable = false;
-                failureReason = "Insufficient stock for product: " + productId + ", available: " + currentStock;
+                failureReason = "Insufficient stock for productId: " + productId;
                 break;
             }
         }
 
-        // Save event log
-        OrderEventLog orderEventLog = new OrderEventLog();
-        orderEventLog.setRequestId(requestId);
-        orderEventLog.setOrderId(orderId);
-        orderEventLog.setEventType("ORDER_CREATED");
-        orderEventLogRepository.save(orderEventLog);
-
-        // Publish inventory event
+        // Prepare outbox event
+        OutboxEvent outboxEvent = new OutboxEvent();
+        outboxEvent.setId(UUID.randomUUID());
+        outboxEvent.setAggregateType("Inventory");
+        outboxEvent.setAggregateId(orderId);
+        outboxEvent.setCreatedAt(OffsetDateTime.now());
+        outboxEvent.setPublished(false);
         if (allStockAvailable) {
             inventoryEvent.setEventType("STOCK_RESERVED");
             inventoryEvent.setStatus("SUCCESS");
+            // Save event log only on success
+            OrderEventLog orderEventLog = new OrderEventLog();
+            orderEventLog.setRequestId(requestId);
+            orderEventLog.setOrderId(orderId);
+            orderEventLog.setEventType("ORDER_CREATED");
+            orderEventLogRepository.save(orderEventLog);
         } else {
-            inventoryEvent.setEventType("STOCK_FAILED");
+            inventoryEvent.setEventType("ORDER_CANCELLED");
             inventoryEvent.setStatus("FAILED");
             inventoryEvent.setReason(failureReason);
+            inventoryEvent.setOrderItems(new ArrayList<>()); // Clear orderItems for failure
         }
-        eventProducerService.publishInventoryEvent(inventoryEvent);
+
+        // Save outbox event
+        try {
+            outboxEvent.setEventType(inventoryEvent.getEventType());
+            outboxEvent.setPayload(objectMapper.writeValueAsString(inventoryEvent));
+            outboxEventRepository.save(outboxEvent);
+            log.info("Saved {} event to outbox for orderId={}", inventoryEvent.getEventType(), orderId);
+        } catch (JsonProcessingException e) {
+            log.error("Failed to serialize {} event for orderId={}", inventoryEvent.getEventType(), orderId, e);
+            throw new RuntimeException("Failed to save outbox event", e);
+        }
 
         if (!allStockAvailable) {
+            log.warn("Stock reservation failed for orderId={}: {}", orderId, failureReason);
             throw new RuntimeException(failureReason);
         }
     }
