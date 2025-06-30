@@ -6,6 +6,8 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
+import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.util.List;
 
 @Getter
@@ -14,10 +16,12 @@ import java.util.List;
 @AllArgsConstructor
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class OrderCreatedEvent {
+    private int version = 1;
     private String eventType;
     private String requestId;
     private Long orderId;
     private List<OrderItem> orderItems;
+    private LocalDateTime orderDateTime;
 
     @Getter
     @Setter
