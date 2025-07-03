@@ -26,7 +26,8 @@ public class StockService {
         }
         String stockKey = "stock:productId:" + productId;
         try {
-            List<Long> result = redisTemplate.execute(reserveStockScript, Collections.singletonList(stockKey), quantity);
+            List<Long> result = redisTemplate.execute(reserveStockScript,
+                    Collections.singletonList(stockKey), quantity.toString());
             if (result == null || result.isEmpty()) {
                 throw new RuntimeException("Redis script execution failed for productId: " + productId);
             }
@@ -41,6 +42,6 @@ public class StockService {
             throw new IllegalArgumentException("Invalid productId or quantity");
         }
         String stockKey = "stock:productId:" + productId;
-        redisTemplate.opsForHash().put(stockKey, "quantity", quantity);
+        redisTemplate.opsForHash().put(stockKey, "quantity", quantity.toString());
     }
 }

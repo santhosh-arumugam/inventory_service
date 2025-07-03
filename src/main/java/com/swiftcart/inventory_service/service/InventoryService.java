@@ -48,33 +48,48 @@ public class InventoryService {
     }
 
     private boolean checkForDuplicateRequest(String requestId) {
-        String idempotencyKey = "idempotency:request:" + requestId;
-        Boolean isNewRequest = redisTemplate.opsForValue().setIfAbsent(idempotencyKey, "PROCESSED");
-        if (Boolean.TRUE.equals(isNewRequest)) {
-            redisTemplate.expire(idempotencyKey, 24, TimeUnit.HOURS);
-            return true;
+        try {
+            String idempotencyKey = "idempotency:request:" + requestId;
+            Boolean isNewRequest = redisTemplate.opsForValue().setIfAbsent(idempotencyKey, "PROCESSED");
+            if (Boolean.TRUE.equals(isNewRequest)) {
+                redisTemplate.expire(idempotencyKey, 24, TimeUnit.HOURS);
+                return true;
+            }
+            log.warn("Duplicate request detected in Redis: requestId={}", requestId);
+            return false;
+        } catch (Exception e) {
+            log.error("Redis connection error during duplicate check for requestId: {}", requestId, e);
+            // If Redis is down, check database for duplicate
+            return !orderEventLogRepository.existsById(requestId);
         }
-        log.warn("Duplicate request detected in Redis: requestId={}", requestId);
-        return false;
     }
 
     private Optional<Inventory> getInventory(Long productId) {
-        String cacheKey = "cache:productId:" + productId;
-        Integer cachedStock = (Integer) redisTemplate.opsForValue().get(cacheKey);
-        if (cachedStock != null) {
-            Inventory inventory = new Inventory();
-            inventory.setProductId(productId);
-            inventory.setQuantity(cachedStock);
-            return Optional.of(inventory);
+        try {
+            String cacheKey = "cache:productId:" + productId;
+            Integer cachedStock = (Integer) redisTemplate.opsForValue().get(cacheKey);
+            if (cachedStock != null) {
+                Inventory inventory = new Inventory();
+                inventory.setProductId(productId);
+                inventory.setQuantity(cachedStock);
+                return Optional.of(inventory);
+            }
+        } catch (Exception e) {
+            log.warn("Redis cache miss for productId: {}, falling back to database", productId, e);
         }
 
+        // Fallback to database
         Optional<Inventory> inventoryOpt = inventoryRepository.findById(productId);
         if (inventoryOpt.isPresent()) {
-            Inventory inventory = inventoryOpt.get();
-            redisTemplate.opsForValue().set(cacheKey, inventory.getQuantity(), 1, TimeUnit.HOURS);
-            return inventoryOpt;
+            try {
+                Inventory inventory = inventoryOpt.get();
+                String cacheKey = "cache:productId:" + productId;
+                redisTemplate.opsForValue().set(cacheKey, inventory.getQuantity(), 1, TimeUnit.HOURS);
+            } catch (Exception e) {
+                log.warn("Failed to cache inventory for productId: {}", productId, e);
+            }
         }
-        return Optional.empty();
+        return inventoryOpt;
     }
 
     @Transactional("transactionManager")
@@ -104,7 +119,7 @@ public class InventoryService {
             Long productId = orderItem.getProductId();
             Integer requestedQty = orderItem.getQuantity();
 
-            // Cache-aside: Get inventory
+            // Get inventory
             Optional<Inventory> inventoryOpt = getInventory(productId);
             if (inventoryOpt.isEmpty()) {
                 allStockAvailable = false;
@@ -112,16 +127,41 @@ public class InventoryService {
                 break;
             }
 
-            // Reserve stock in Redis
-            boolean reserved = stockService.reserveStock(productId, requestedQty);
-            if (reserved) {
-                // Update Postgres
+            // Try to reserve stock in Redis, fallback to in-memory check if Redis is down
+            boolean reserved = false;
+            try {
+                reserved = stockService.reserveStock(productId, requestedQty);
+            } catch (Exception e) {
+                log.warn("Redis stock reservation failed for productId: {}, falling back to database check", productId, e);
+                // Fallback: check stock in database and reserve
                 Inventory inventory = inventoryOpt.get();
-                inventory.setQuantity(inventory.getQuantity() - requestedQty);
-                inventoryRepository.save(inventory);
+                if (inventory.getQuantity() >= requestedQty) {
+                    inventory.setQuantity(inventory.getQuantity() - requestedQty);
+                    inventoryRepository.save(inventory);
+                    reserved = true;
+                } else {
+                    reserved = false;
+                }
+            }
+
+            if (reserved) {
+                // Update Postgres if not already done in fallback
+                try {
+                    Inventory inventory = inventoryOpt.get();
+                    if (inventory.getQuantity() >= requestedQty) {
+                        inventory.setQuantity(inventory.getQuantity() - requestedQty);
+                        inventoryRepository.save(inventory);
+                    }
+                } catch (Exception e) {
+                    log.warn("Database update failed for productId: {}", productId, e);
+                }
 
                 // Invalidate cache
-                redisTemplate.delete("cache:productId:" + productId);
+                try {
+                    redisTemplate.delete("cache:productId:" + productId);
+                } catch (Exception e) {
+                    log.warn("Cache invalidation failed for productId: {}", productId, e);
+                }
 
                 // Add to inventory event
                 inventoryEvent.getOrderItems().add(new InventoryEvent.OrderItem(productId, requestedQty));
@@ -139,6 +179,7 @@ public class InventoryService {
         outboxEvent.setAggregateId(orderId);
         outboxEvent.setCreatedAt(OffsetDateTime.now());
         outboxEvent.setPublished(false);
+
         if (allStockAvailable) {
             inventoryEvent.setEventType("STOCK_RESERVED");
             inventoryEvent.setStatus("SUCCESS");

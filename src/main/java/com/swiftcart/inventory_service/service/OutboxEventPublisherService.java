@@ -15,12 +15,12 @@ import java.util.List;
 @Slf4j
 public class OutboxEventPublisherService {
     private final OutboxEventRepository outboxEventRepository;
-    private final KafkaTemplate<String, String> kafkaTemplate;
+    private final KafkaTemplate<String, Object> kafkaTemplate;  // Changed from String to Object
     private final String topicName;
 
     public OutboxEventPublisherService(
             OutboxEventRepository outboxEventRepository,
-            KafkaTemplate<String, String> kafkaTemplate,
+            KafkaTemplate<String, Object> kafkaTemplate,  // Changed from String to Object
             @Value("${inventory.topic.name:inventory-events}") String topicName
     ) {
         this.outboxEventRepository = outboxEventRepository;
@@ -34,13 +34,20 @@ public class OutboxEventPublisherService {
         List<OutboxEvent> events = outboxEventRepository.findByPublishedFalse();
         for (OutboxEvent event : events) {
             try {
-                kafkaTemplate.executeInTransaction(kafkaOps -> {
-                    kafkaOps.send(topicName, String.valueOf(event.getAggregateId()), event.getPayload());
-                    outboxEventRepository.delete(event);
-                    log.info("Published and deleted outbox event: id={}, eventType={}, aggregateId={}",
-                            event.getId(), event.getEventType(), event.getAggregateId());
-                    return true;
-                });
+                // Send the payload as a String (JSON)
+                kafkaTemplate.send(topicName, String.valueOf(event.getAggregateId()), event.getPayload())
+                        .whenComplete((result, ex) -> {
+                            if (ex == null) {
+                                // Mark as published on successful send
+                                event.setPublished(true);
+                                outboxEventRepository.save(event);
+                                log.info("Published outbox event: id={}, eventType={}, aggregateId={}",
+                                        event.getId(), event.getEventType(), event.getAggregateId());
+                            } else {
+                                log.error("Failed to publish outbox event: id={}, error={}",
+                                        event.getId(), ex.getMessage());
+                            }
+                        });
             } catch (Exception e) {
                 log.error("Failed to publish outbox event: id={}, eventType={}, aggregateId={}, error={}",
                         event.getId(), event.getEventType(), event.getAggregateId(), e.getMessage());
