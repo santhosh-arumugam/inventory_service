@@ -25,7 +25,7 @@ public class OutboxEvent {
     @Column(name = "event_type", nullable = false)
     private String eventType;
 
-    @Column(name = "payload", nullable = false)
+    @Column(name = "payload", nullable = false, columnDefinition = "TEXT")
     private String payload;
 
     @Column(name = "created_at", nullable = false)
@@ -35,5 +35,6 @@ public class OutboxEvent {
     private boolean published = false;
 
     @Version
+    @Column(name = "version")
     private Long version;
 }
