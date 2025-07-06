@@ -59,14 +59,16 @@ public class InventoryService {
             Long productId = orderItem.getProductId();
             Integer requestedQty = orderItem.getQuantity();
 
-            // Check and reserve stock
-            if (!reserveStock(productId, requestedQty)) {
+            // Check and reserve stock with proper Redis-DB sync
+            StockReservationResult result = reserveStockWithSync(productId, requestedQty);
+
+            if (result.isSuccess()) {
+                inventoryEvent.getOrderItems().add(new InventoryEvent.OrderItem(productId, requestedQty));
+            } else {
                 allStockAvailable = false;
-                failureReason = "Insufficient stock for productId: " + productId;
+                failureReason = result.getReason();
                 break;
             }
-
-            inventoryEvent.getOrderItems().add(new InventoryEvent.OrderItem(productId, requestedQty));
         }
 
         // Prepare outbox event
@@ -105,6 +107,70 @@ public class InventoryService {
         }
     }
 
+    private StockReservationResult reserveStockWithSync(Long productId, Integer requestedQty) {
+        // First, check if product exists in database
+        Optional<Inventory> inventoryOpt = inventoryRepository.findById(productId);
+        if (inventoryOpt.isEmpty()) {
+            return new StockReservationResult(false, "Product not found in database: productId=" + productId);
+        }
+
+        Inventory inventory = inventoryOpt.get();
+
+        // Sync Redis with DB if needed
+        syncRedisWithDatabase(productId, inventory.getQuantity());
+
+        // Try to reserve stock in Redis
+        try {
+            boolean reserved = stockService.reserveStock(productId, requestedQty);
+
+            if (reserved) {
+                // Update database to match Redis
+                inventory.setQuantity(inventory.getQuantity() - requestedQty);
+                inventoryRepository.save(inventory);
+                log.info("Reserved {} units of productId={}, remaining: {}", requestedQty, productId, inventory.getQuantity());
+                return new StockReservationResult(true, null);
+            } else {
+                return new StockReservationResult(false, "Insufficient stock for productId: " + productId);
+            }
+        } catch (Exception e) {
+            log.error("Error reserving stock in Redis for productId: {}", productId, e);
+
+            // Fallback: Try direct database reservation
+            if (inventory.getQuantity() >= requestedQty) {
+                inventory.setQuantity(inventory.getQuantity() - requestedQty);
+                inventoryRepository.save(inventory);
+
+                // Try to sync Redis after DB update
+                try {
+                    String stockKey = "stock:productId:" + productId;
+                    redisTemplate.opsForHash().put(stockKey, "quantity", String.valueOf(inventory.getQuantity()));
+                } catch (Exception redisEx) {
+                    log.warn("Failed to update Redis after DB reservation for productId: {}", productId);
+                }
+
+                log.info("Reserved {} units of productId={} via database, remaining: {}", requestedQty, productId, inventory.getQuantity());
+                return new StockReservationResult(true, null);
+            } else {
+                return new StockReservationResult(false, "Insufficient stock for productId: " + productId);
+            }
+        }
+    }
+
+    private void syncRedisWithDatabase(Long productId, Integer dbQuantity) {
+        try {
+            String stockKey = "stock:productId:" + productId;
+            Object redisQuantity = redisTemplate.opsForHash().get(stockKey, "quantity");
+
+            if (redisQuantity == null) {
+                // Redis doesn't have this product, sync from DB
+                redisTemplate.opsForHash().put(stockKey, "quantity", String.valueOf(dbQuantity));
+                log.info("Synced Redis with DB for productId={}, quantity={}", productId, dbQuantity);
+            }
+        } catch (Exception e) {
+            log.warn("Failed to sync Redis with database for productId: {}", productId, e);
+        }
+    }
+
     private boolean checkForDuplicateRequest(String requestId) {
         try {
             String idempotencyKey = "idempotency:request:" + requestId;
@@ -121,31 +187,21 @@ public class InventoryService {
         }
     }
 
-    private boolean reserveStock(Long productId, Integer requestedQty) {
-        try {
-            // Try Redis first
-            return stockService.reserveStock(productId, requestedQty);
-        } catch (Exception e) {
-            log.warn("Redis stock reservation failed for productId: {}, falling back to database", productId, e);
+    private static class StockReservationResult {
+        private final boolean success;
+        private final String reason;
 
-            // Fallback to database
-            Optional<Inventory> inventoryOpt = inventoryRepository.findById(productId);
-            if (inventoryOpt.isPresent()) {
-                Inventory inventory = inventoryOpt.get();
-                if (inventory.getQuantity() >= requestedQty) {
-                    inventory.setQuantity(inventory.getQuantity() - requestedQty);
-                    inventoryRepository.save(inventory);
+        public StockReservationResult(boolean success, String reason) {
+            this.success = success;
+            this.reason = reason;
+        }
 
-                    // Try to update Redis cache
-                    try {
-                        redisTemplate.delete("cache:productId:" + productId);
-                    } catch (Exception redisEx) {
-                        log.warn("Failed to invalidate cache for productId: {}", productId);
-                    }
-                    return true;
-                }
-            }
-            return false;
+        public boolean isSuccess() {
+            return success;
+        }
+
+        public String getReason() {
+            return reason;
         }
     }
 }
